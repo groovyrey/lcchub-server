@@ -36,17 +36,15 @@ const auth = (req, res, next) => {
     next();
 };
 
-// Route: Initialize or reuse a session
+// Route: Update or initialize a session
 app.post('/session/:userId', auth, async (req, res) => {
     const { userId } = req.params;
     const { jarData } = req.body;
     
-    let client = await proxyManager.getClient(userId);
-    if (!client) {
-        client = await proxyManager.createSession(userId, jarData);
-    }
+    // Always recreate to ensure the RAM cache has the freshest cookies
+    await proxyManager.createSession(userId, jarData);
     
-    res.json({ success: true, cached: !!client });
+    res.json({ success: true, updated: true });
 });
 
 // Route: Proxy request to Schoolista

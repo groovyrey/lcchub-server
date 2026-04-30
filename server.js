@@ -58,10 +58,19 @@ app.get('/proxy/:userId', auth, async (req, res) => {
     }
 
     try {
-        const portalRes = await client.get(`${process.env.PORTAL_BASE}${path}`);
+        // Optimization: Forward Referer and common headers
+        const portalRes = await client.get(`${process.env.PORTAL_BASE}${path}`, {
+            headers: {
+                'Referer': req.headers['referer'] || `${process.env.PORTAL_BASE}/Student/Main.aspx`,
+                'User-Agent': req.headers['user-agent'],
+                'Accept': req.headers['accept']
+            }
+        });
         res.send(portalRes.data);
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        // If the portal itself returns an error, forward that status
+        const status = error.response?.status || 500;
+        res.status(status).json({ error: error.message });
     }
 });
 

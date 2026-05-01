@@ -67,6 +67,16 @@ app.post('/session/:userId', auth, async (req, res) => {
     // Always recreate to ensure the RAM cache has the freshest cookies
     await proxyManager.createSession(userId, jarData);
     
+    // Notify via Ably
+    if (ably) {
+        const channel = ably.channels.get(`student-${userId}`);
+        channel.publish('proxy-status', { 
+            type: 'SESSION_SYNCED',
+            message: 'Your session has been synchronized with the remote proxy.',
+            timestamp: Date.now() 
+        }).catch(() => {});
+    }
+    
     res.json({ success: true, updated: true });
 });
 
@@ -75,7 +85,9 @@ const proxyHandler = async (req, res) => {
     const { userId } = req.params;
     const { path } = req.query; // e.g. /Student/Main.aspx?_sid=123
     
+    const session = proxyManager.sessions.get(userId);
     const client = await proxyManager.getClient(userId, db);
+
     if (!client) {
         return res.status(404).json({ error: 'Session not found in RAM. Please re-init.' });
     }
@@ -92,7 +104,10 @@ const proxyHandler = async (req, res) => {
 
         let portalRes;
         if (req.method === 'POST') {
-            const body = typeof req.body === 'string' ? req.body : new URLSearchParams(req.body).toString();
+            // Forward body correctly
+            const body = (req.headers['content-type']?.includes('application/x-www-form-urlencoded')) 
+                ? (typeof req.body === 'string' ? req.body : new URLSearchParams(req.body).toString())
+                : req.body;
             portalRes = await client.post(`${process.env.PORTAL_BASE}${path}`, body, config);
         } else if (req.method === 'PUT') {
             portalRes = await client.put(`${process.env.PORTAL_BASE}${path}`, req.body, config);
@@ -100,6 +115,12 @@ const proxyHandler = async (req, res) => {
             portalRes = await client.get(`${process.env.PORTAL_BASE}${path}`, config);
         }
         
+        // If it was a login or something that likely changed cookies, sync back (throttled)
+        if (req.method === 'POST' && session) {
+            // Background sync cookies to Firestore
+            saveSessionToFirestore(userId, session.jar).catch(() => {});
+        }
+
         res.send(portalRes.data);
     } catch (error) {
         const status = error.response?.status || 500;
@@ -111,6 +132,21 @@ const proxyHandler = async (req, res) => {
 app.get('/proxy/:userId', auth, proxyHandler);
 app.post('/proxy/:userId', auth, proxyHandler);
 app.put('/proxy/:userId', auth, proxyHandler);
+
+// Route: Explicitly sync session from Portal to Proxy
+app.post('/sync/:userId', auth, async (req, res) => {
+    const { userId } = req.params;
+    const { jarData } = req.body;
+    
+    if (jarData) {
+        await proxyManager.createSession(userId, jarData);
+        // Also ensure it's in Firestore
+        const session = proxyManager.sessions.get(userId);
+        if (session) await saveSessionToFirestore(userId, session.jar);
+    }
+    
+    res.json({ success: true });
+});
 
 // Background Sync Task (Every 30 minutes)
 cron.schedule('*/30 * * * *', async () => {
@@ -129,12 +165,33 @@ cron.schedule('*/30 * * * *', async () => {
             // 2. Check if we are still logged in
             if (res.data.includes('obtnLogin') || res.data.includes('otbUserID')) {
                 console.warn(`[Sync] Session expired for ${userId}. Removing from RAM.`);
+                
+                // Notify via Ably
+                if (ably) {
+                    const channel = ably.channels.get(`student-${userId}`);
+                    channel.publish('proxy-status', { 
+                        type: 'SESSION_EXPIRED',
+                        message: 'Your portal session has expired. Please re-login to restore cloud sync.',
+                        timestamp: Date.now() 
+                    }).catch(() => {});
+                }
+
                 proxyManager.sessions.delete(userId);
                 continue;
             }
 
             // 3. Sync cookies back to Firestore to ensure persistence
             await saveSessionToFirestore(userId, session.jar);
+
+            // Notify session refresh success
+            if (ably) {
+                const channel = ably.channels.get(`student-${userId}`);
+                channel.publish('proxy-status', { 
+                    type: 'REFRESH_COMPLETE',
+                    message: 'Background session refresh successful.',
+                    timestamp: Date.now() 
+                }).catch(() => {});
+            }
 
             // 4. Detect "New Grades" by looking at report links
             const currentReports = [];
